@@ -173,8 +173,18 @@ func ResetWorktree(worktreePath, branch string) error {
 	if _, err := runGit(worktreePath, "reset", "--hard", ref); err != nil {
 		return err
 	}
-	_, err = runGit(worktreePath, "clean", "-fd")
-	return err
+	if _, err = runGit(worktreePath, "clean", "-fd"); err != nil {
+		return err
+	}
+	// Re-align nested submodules to the superproject's recorded gitlinks. checkout,
+	// reset, and clean do not recurse into submodules, so a pooled worktree that
+	// uses submodules would otherwise come back "dirty" on the submodule-gitlink
+	// pointer and never be reissued - the pool bloats with unusable slots. This is
+	// a no-op on a repo with no submodules, and best-effort: a failure (e.g. a
+	// submodule commit that needs an unreachable fetch) leaves the slot as it was
+	// rather than failing the reset, so it never regresses today's behavior.
+	_, _ = runGit(worktreePath, "submodule", "update", "--init", "--recursive")
+	return nil
 }
 
 func DetachWorktree(worktreePath string) error {

@@ -112,3 +112,59 @@ func mustGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
+
+func TestResetWorktreeRecursesSubmodules(t *testing.T) {
+	base := t.TempDir()
+	sub := filepath.Join(base, "sub")
+	super := filepath.Join(base, "super")
+
+	// Submodule origin with two commits; the superproject will record the first.
+	mustGit(t, "", "init", "--initial-branch=main", sub)
+	mustGit(t, sub, "config", "user.email", "test@test.com")
+	mustGit(t, sub, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, sub, "add", ".")
+	mustGit(t, sub, "commit", "-m", "c1")
+	c1, err := runGit(sub, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "f"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, sub, "commit", "-am", "c2")
+	c2, err := runGit(sub, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, sub, "checkout", c1) // record c1 in the super at add time
+
+	// Superproject embedding the submodule at c1.
+	mustGit(t, "", "init", "--initial-branch=main", super)
+	mustGit(t, super, "config", "user.email", "test@test.com")
+	mustGit(t, super, "config", "user.name", "Test")
+	mustGit(t, super, "config", "protocol.file.allow", "always") // allow the local-path submodule
+	mustGit(t, super, "submodule", "add", sub, "mod")
+	mustGit(t, super, "add", ".")
+	mustGit(t, super, "commit", "-m", "add submodule")
+
+	// Simulate a returned pooled slot: the submodule working tree has drifted off
+	// the superproject's recorded gitlink (a plain reset does not recurse into it).
+	mustGit(t, filepath.Join(super, "mod"), "checkout", c2)
+	if dirty, _ := IsDirty(super); !dirty {
+		t.Fatal("fixture: a drifted submodule should make the worktree dirty")
+	}
+
+	if err := ResetWorktree(super, "main"); err != nil {
+		t.Fatalf("ResetWorktree failed: %v", err)
+	}
+
+	if dirty, err := IsDirty(super); err != nil || dirty {
+		t.Fatalf("worktree still dirty after reset; submodules were not re-synced (dirty=%v err=%v)", dirty, err)
+	}
+	if got, _ := runGit(filepath.Join(super, "mod"), "rev-parse", "HEAD"); got != c1 {
+		t.Fatalf("submodule not re-aligned to recorded gitlink: got %s want %s", got, c1)
+	}
+}
