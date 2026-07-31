@@ -292,6 +292,175 @@ func TestResetWorktreeFailsWhenSubmodulesCannotBeAligned(t *testing.T) {
 	t.Logf("reset failed loudly on an unusable slot, as intended: %v", err)
 }
 
+// nestedSubmoduleFixture builds the exact shape that jams a pooled slot on any
+// superproject commit that moves a submodule gitlink. Two production facts are
+// both load-bearing, and either one alone is harmless:
+//
+//  1. The slot's submodule remote is the PARENT clone's module store, and that
+//     store sits detached with only remote-tracking refs - no refs/heads/*. A
+//     pooled slot gets its own submodule gitdir, so it cannot borrow the parent
+//     clone's objects; and pointing it at the parent store is what lets a slot
+//     initialise with the real remote unreachable. The default refspec
+//     (+refs/heads/*) then matches nothing, so `submodule update`'s FIRST fetch
+//     imports no history and the gitlink commit is still missing afterwards.
+//     That pushes git onto its fallback: fetch the commit directly by sha.
+//
+//  2. mod's HISTORY records a gitlink for deep that deep's own remote does not
+//     have. Repositories reach that state routinely - a rewritten nested
+//     history, a fork, a deleted branch, or a nested remote unreachable from
+//     this machine. The tip is perfectly healthy; an older commit is not.
+//
+// The direct-by-sha fetch imports that history, git's on-demand fetch-time
+// recursion demands the unreachable nested gitlink, the nested fetch fails, and
+// git blames the OUTER submodule - because it checks the fetch's exit status
+// before checking whether the object arrived. In the plain case (1) does not
+// hold, the first fetch imports the history, the fallback finds nothing new to
+// recurse into, and the bug hides.
+//
+// It returns the slot plus the two commits a reset has to land on: the mod
+// commit super pins after the bump, and the deep commit mod pins there.
+func nestedSubmoduleFixture(t *testing.T) (slot, wantMod, wantDeep string) {
+	t.Helper()
+	isolateGitConfig(t)
+
+	base := t.TempDir()
+	deep := filepath.Join(base, "deep")
+	fork := filepath.Join(base, "fork")
+	mod := filepath.Join(base, "mod")
+	super := filepath.Join(base, "super")
+	slot = filepath.Join(base, "slot")
+
+	initRepo(t, deep)
+	writeFile(t, filepath.Join(deep, "f"), "d1\n")
+	mustGit(t, deep, "add", ".")
+	mustGit(t, deep, "commit", "-m", "d1")
+	wantDeep = revParse(t, deep, "HEAD")
+
+	// A commit that exists only in a fork. deep - the remote .gitmodules names -
+	// never has it, which is what makes the nested fetch below unsatisfiable.
+	mustGit(t, "", "-c", protocolFileAllow, "clone", "-q", deep, fork)
+	mustGit(t, fork, "config", "user.email", "test@test.com")
+	mustGit(t, fork, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(fork, "f"), "d2\n")
+	mustGit(t, fork, "commit", "-am", "d2")
+	missingDeep := revParse(t, fork, "HEAD")
+
+	initRepo(t, mod)
+	mustGit(t, mod, "-c", protocolFileAllow, "submodule", "add", deep, "deep")
+	mustGit(t, mod, "commit", "-m", "m1 pins a reachable deep commit")
+
+	initRepo(t, super)
+	mustGit(t, super, "-c", protocolFileAllow, "submodule", "add", mod, "mod")
+	mustGit(t, super, "commit", "-m", "add submodule")
+
+	// Fact (1): put the parent's module store in the state a real one is in -
+	// detached, remote-tracking refs only.
+	superMod := filepath.Join(super, "mod")
+	store := filepath.Join(super, ".git", "modules", "mod")
+	mustGit(t, superMod, "checkout", "-q", "--detach", "HEAD")
+	mustGit(t, store, "branch", "-q", "-D", "main")
+	if refs, err := runGit(store, "for-each-ref", "refs/heads"); err != nil || refs != "" {
+		t.Fatalf("fixture: parent store must advertise no refs/heads (got %q err=%v)", refs, err)
+	}
+
+	// The slot is cut BEFORE the bump, so its own submodule stores hold only the
+	// history that existed then - exactly like a pooled worktree handed out
+	// before someone merged a gitlink bump - and it fetches from the parent
+	// store, not from mod's real remote.
+	mustGit(t, super, "worktree", "add", "--detach", slot, "main")
+	mustGit(t, slot, "-c", protocolFileAllow, "-c", "submodule.mod.url="+store,
+		"submodule", "update", "--init", "--recursive")
+
+	// Fact (2): m2 pins the fork-only commit; m3 moves back to a reachable one.
+	// Only m3 is ever checked out, but a fetch that imports mod's history still
+	// SEES m2's gitlink.
+	modDeep := filepath.Join(mod, "deep")
+	mustGit(t, modDeep, "remote", "add", "fork", fork)
+	mustGit(t, modDeep, "-c", protocolFileAllow, "fetch", "-q", "fork")
+	mustGit(t, modDeep, "remote", "remove", "fork")
+	mustGit(t, modDeep, "checkout", "-q", "--detach", missingDeep)
+	mustGit(t, mod, "commit", "-am", "m2 pins a deep commit its remote lacks")
+	mustGit(t, modDeep, "checkout", "-q", "--detach", wantDeep)
+	mustGit(t, mod, "commit", "-am", "m3 pins a reachable deep commit again")
+	wantMod = revParse(t, mod, "HEAD")
+
+	mustGit(t, superMod, "-c", protocolFileAllow, "fetch", "-q", "origin")
+	mustGit(t, superMod, "checkout", "-q", "--detach", wantMod)
+	mustGit(t, super, "commit", "-am", "bump gitlink")
+
+	mustGit(t, slot, "checkout", "--detach", "--force", "main")
+	return slot, wantMod, wantDeep
+}
+
+// TestResetWorktreeAlignsSubmoduleWithUnreachableNestedHistory is the regression
+// test for the pool-wide jam: git's fetch-time submodule recursion defaults to
+// "on-demand", so the fetch that pulls the submodule commit a gitlink pins also
+// demands every NESTED gitlink it sees in the newly downloaded history. One
+// nested commit the nested remote does not have fails that fetch, and git then
+// reports the outer submodule as unfetchable even though its commit arrived:
+//
+//	fatal: Fetched in submodule path 'mod', but it did not contain <sha>.
+//	       Direct fetching of that commit failed.
+//
+// The reset fails, the gitlink stays modified, and the slot can never be
+// returned - so every slot in the pool jams on the same superproject commit.
+func TestResetWorktreeAlignsSubmoduleWithUnreachableNestedHistory(t *testing.T) {
+	slot, wantMod, wantDeep := nestedSubmoduleFixture(t)
+
+	if dirty, _ := IsDirty(slot); !dirty {
+		t.Fatal("fixture: an unaligned gitlink should make the slot dirty")
+	}
+
+	// Non-vacuity guard: with the file transport already allowed - i.e. with
+	// everything the previous fix provides - the update still fails, because
+	// fetch-time recursion is what breaks. Without this the test below would
+	// pass even with the fix reverted.
+	if _, err := runGit(slot, "-c", protocolFileAllow,
+		"submodule", "update", "--init", "--recursive", "--force"); err == nil {
+		t.Fatal("fixture is vacuous: the update should fail on the unreachable nested gitlink")
+	} else if !strings.Contains(err.Error(), "Direct fetching of that commit failed") {
+		t.Fatalf("fixture should fail on the nested fetch, got: %v", err)
+	}
+
+	if err := ResetWorktree(slot, "main"); err != nil {
+		t.Fatalf("ResetWorktree failed: %v", err)
+	}
+	if dirty, err := IsDirty(slot); err != nil || dirty {
+		t.Fatalf("slot still dirty after reset, so it would never be reissued (dirty=%v err=%v)", dirty, err)
+	}
+	if got := revParse(t, filepath.Join(slot, "mod"), "HEAD"); got != wantMod {
+		t.Fatalf("submodule not re-aligned: got %s want %s", got, wantMod)
+	}
+	// The nested level must still be aligned: suppressing fetch-time recursion
+	// must not stop `submodule update --recursive` from descending.
+	if got := revParse(t, filepath.Join(slot, "mod", "deep"), "HEAD"); got != wantDeep {
+		t.Fatalf("nested submodule not re-aligned: got %s want %s", got, wantDeep)
+	}
+}
+
+func initRepo(t *testing.T, path string) {
+	t.Helper()
+	mustGit(t, "", "init", "-q", "--initial-branch=main", path)
+	mustGit(t, path, "config", "user.email", "test@test.com")
+	mustGit(t, path, "config", "user.name", "Test")
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func revParse(t *testing.T, dir, rev string) string {
+	t.Helper()
+	out, err := runGit(dir, "rev-parse", rev)
+	if err != nil {
+		t.Fatalf("rev-parse %s in %s: %v", rev, dir, err)
+	}
+	return out
+}
+
 func mustGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

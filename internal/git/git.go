@@ -174,6 +174,41 @@ func Fetch(repoRoot string) error {
 // superproject's own config does not reach the child clone/fetch process.
 const protocolFileAllow = "protocol.file.allow=always"
 
+// noFetchRecurseSubmodules stops a submodule's own fetch from recursing into
+// that submodule's submodules. `submodule update --recursive` already descends
+// level by level and fetches exactly the gitlink each level records, so the
+// recursion is redundant - but it is not harmless: git's fetch-time recursion
+// defaults to "on-demand", which asks the NESTED remote for every nested gitlink
+// value it sees in the newly downloaded history, not just the one being checked
+// out. Deep history routinely pins nested commits that the nested remote no
+// longer has (rewritten history, a fork, a deleted branch, or simply a remote
+// unreachable from this machine), and one such miss fails the whole fetch:
+//
+//	Fetching submodule frappe-ui
+//	fatal: remote error: upload-pack: not our ref 19bdc114...
+//	Errors during submodule fetch: frappe-ui
+//
+// git then reports the OUTER submodule as unfetchable even though its commit
+// arrived, because it checks the fetch's exit status before checking whether the
+// object is present:
+//
+//	fatal: Fetched in submodule path 'libs/helpdesk', but it did not contain
+//	       d2fe1197... Direct fetching of that commit failed.
+//
+// A pooled slot is where this bites, because it is where git falls back to the
+// direct-by-sha fetch in the first place: the slot's submodule remote is the
+// parent clone's module store, which sits detached with only remote-tracking
+// refs, so the default +refs/heads/* refspec matches nothing and the first
+// fetch imports no history at all. The fallback is then the fetch that imports
+// everything - and the one whose recursion has nothing behind it. Elsewhere the
+// first fetch usually imports the history, the fallback finds nothing new to
+// recurse into, and the same repository looks fine.
+//
+// The reset then fails, the gitlink stays modified, and the slot can never be
+// returned - every slot in the pool jams on the next superproject commit that
+// moves that gitlink.
+const noFetchRecurseSubmodules = "fetch.recurseSubmodules=no"
+
 func ResetWorktree(worktreePath, branch string) error {
 	repoRoot, err := runGit(worktreePath, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -204,7 +239,7 @@ func ResetWorktree(worktreePath, branch string) error {
 func syncSubmodules(worktreePath string) error {
 	// --force discards tracked modifications inside a submodule working tree.
 	// Without it, update leaves a dirty submodule dirty and reports success.
-	if _, err := runGit(worktreePath, "-c", protocolFileAllow,
+	if _, err := runGit(worktreePath, "-c", protocolFileAllow, "-c", noFetchRecurseSubmodules,
 		"submodule", "update", "--init", "--recursive", "--force"); err != nil {
 		return err
 	}
