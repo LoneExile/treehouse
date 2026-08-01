@@ -161,6 +161,19 @@ func Fetch(repoRoot string) error {
 	return err
 }
 
+// protocolFileAllow lets git's submodule machinery clone and fetch over a local
+// filesystem path. A linked worktree inherits the superproject's .gitmodules
+// URL, and for a pooled worktree cut from a local clone that URL is itself a
+// path on disk, so every submodule clone/fetch a pool slot performs is a "file"
+// transport - which git refuses by default (protocol.file.allow=user, the
+// CVE-2022-39253 hardening). Without this the slot can never fetch the commit
+// its gitlink pins, the gitlink stays modified, IsDirty stays true, and the slot
+// is never reissued until the pool starves.
+//
+// It has to be passed as a -c flag: setting protocol.file.allow in the
+// superproject's own config does not reach the child clone/fetch process.
+const protocolFileAllow = "protocol.file.allow=always"
+
 func ResetWorktree(worktreePath, branch string) error {
 	repoRoot, err := runGit(worktreePath, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -173,7 +186,34 @@ func ResetWorktree(worktreePath, branch string) error {
 	if _, err := runGit(worktreePath, "reset", "--hard", ref); err != nil {
 		return err
 	}
-	_, err = runGit(worktreePath, "clean", "-fd")
+	if _, err := runGit(worktreePath, "clean", "-fd"); err != nil {
+		return err
+	}
+	return syncSubmodules(worktreePath)
+}
+
+// syncSubmodules re-aligns nested submodules with the superproject's recorded
+// gitlinks and clears their working trees. checkout, reset, and clean do not
+// recurse into submodules, so a pooled worktree that uses them would otherwise
+// come back dirty on the submodule gitlink and never be reissued. No-op on a
+// repository without submodules.
+//
+// Failures are returned rather than swallowed: a slot whose submodules could not
+// be re-aligned is dirty and unusable, and reporting the reset as successful is
+// what lets an unusable slot go back into the pool looking healthy.
+func syncSubmodules(worktreePath string) error {
+	// --force discards tracked modifications inside a submodule working tree.
+	// Without it, update leaves a dirty submodule dirty and reports success.
+	if _, err := runGit(worktreePath, "-c", protocolFileAllow,
+		"submodule", "update", "--init", "--recursive", "--force"); err != nil {
+		return err
+	}
+	// update does not remove untracked files inside a submodule, and untracked
+	// submodule content still marks the superproject dirty - so mirror the
+	// superproject's own `clean -fd` inside every submodule.
+	_, err := runGit(worktreePath, "-c", protocolFileAllow,
+		"submodule", "foreach", "--recursive", "--quiet",
+		"git", "clean", "-ffdq")
 	return err
 }
 

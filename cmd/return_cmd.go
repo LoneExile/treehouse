@@ -61,7 +61,7 @@ var returnCmd = &cobra.Command{
 }
 
 func init() {
-	returnCmd.Flags().BoolVar(&returnForce, "force", false, "Clean, reset, and return without prompting")
+	returnCmd.Flags().BoolVar(&returnForce, "force", false, "Clean, reset, and return without prompting; also discards tracked modifications and untracked files inside submodules")
 	rootCmd.AddCommand(returnCmd)
 }
 
